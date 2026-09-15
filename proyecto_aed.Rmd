@@ -1,0 +1,334 @@
+---
+title: "Esperanza de vida y factores socioeconomicos"
+subtitle: "Entrega 1 - Analisis exploratorio y limpieza de la base de datos"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    number_sections: true
+---
+
+
+# Introduccion
+
+La base de datos que vamos a trabajar es **Life Expectancy Data (Updated)**,
+disponible en Kaggle. Contiene indicadores de salud, economia y educacion
+para distintos paises entre 2000 y 2015, y la idea del proyecto es explorar
+que factores socioeconomicos y de salud estan mas asociados a la esperanza
+de vida.
+
+Antes que nada, hay que revisar la calidad de los datos:
+ver si hay errores de captura, variables mal codificadas, datos faltantes,
+etc.
+
+# Librerias
+
+Usamos `dplyr` para la manipulacion de datos, `readr` para leer el csv y
+`knitr` para las tablas. El siguiente chunk las instala solo si no las
+tenemos instaladas todavia.
+
+```{r librerias}
+library(dplyr)
+library(readr)
+library(knitr)
+```
+
+# Carga del dataset
+
+```{r cargar-datos}
+df <- read_csv("Life-Expectancy-Data-Updated.csv", show_col_types = FALSE)
+
+cat("Filas:", nrow(df), "\n")
+cat("Columnas:", ncol(df), "\n")
+```
+
+# Exploracion inicial
+
+Vale la pena mirar como viene la base, que tipo de
+dato tiene cada columna, si hay valores faltantes, cuantos paises y años
+cubre, etc.
+
+```{r estructura}
+str(df)
+```
+
+```{r resumen}
+summary(df)
+```
+
+## Valores faltantes por columna
+
+```{r na-por-columna}
+na_por_columna <- colSums(is.na(df))
+na_por_columna[na_por_columna > 0]
+```
+
+No hay valores faltantes en ninguna columna, lo cual tiene sentido porque
+el dataset ya viene limpio por quien lo subio a Kaggle. Igual eso no
+significa que los datos esten bien, puede darse la casualidad de valores mal escritos.
+
+## Cobertura de paises y años
+
+```{r cobertura}
+cat("Paises distintos:", n_distinct(df$Country), "\n")
+cat("Regiones distintas:", n_distinct(df$Region), "\n")
+cat("Rango de años:", min(df$Year), "-", max(df$Year), "\n")
+```
+
+## Primeras filas
+
+```{r head-inicial}
+kable(head(df))
+```
+
+# Limpieza y transformacion de los datos
+
+## Unificar las columnas de status economico
+
+El dataset trae el status de cada pais repartido en dos columnas dummy,
+`Economy_status_Developed` y `Economy_status_Developing` (1/0). Es
+redundante tener dos columnas para representar una sola variable
+categorica, asi que las juntamos en una sola columna `Status` con los
+valores `Developed` / `Developing`, y la ubicamos despues de `Region` para
+que quede mas ordenado.
+
+```{r unificar-status}
+df <- df %>%
+  mutate(Status = case_when(
+    Economy_status_Developed == 1 ~ "Developed",
+    Economy_status_Developing == 1 ~ "Developing",
+    TRUE ~ NA_character_
+  )) %>%
+  select(-Economy_status_Developed, -Economy_status_Developing) %>%
+  relocate(Status, .after = Region)
+
+table(df$Status)
+```
+
+## Ordenar la base
+
+Ordenamos por pais de manera alfabetica y despues por año, para que quede
+mas facil de leer y para que la correccion de la siguiente seccion tenga sentido.
+
+```{r ordenar}
+df <- df %>% arrange(Country, Year)
+kable(head(df))
+```
+
+## Corregir el error del "cero perdido" en thinness
+
+Revisando columna por columna nos dimos cuenta de que
+`Thinness_ten_nineteen_years` y `Thinness_five_nine_years` tienen un
+problema de recoleccion: algunos valores que deberian ser de dos digitos
+(por ejemplo 20.3) quedaron guardados como si fueran de un digito (2.3),
+como si se hubiera perdido el cero. El dataset original ya venia con esta
+correccion aplicada en otras columnas como Adult_mortality, GDP, Population,
+BMI, pero a estas dos columnas de thinness se les paso por alto.
+
+Para detectarlo de forma automatica, comparamos cada valor con los de su
+mismo pais en años cercanos: si un valor es unas 10 veces mas chico que
+sus vecinos y multiplicarlo por 10 lo deja mas cerca de ellos, asumimos que
+se perdio el cero y lo corregimos. La funcion de abajo hace justamente eso,
+pais por pais.
+
+```{r funcion-cero-perdido}
+corregir_cero_perdido <- function(valores, umbral_mismo_regimen = 2.5) {
+  n <- length(valores)
+  corregido <- as.numeric(valores)
+  if (n < 2) return(corregido)
+
+  # Primero agrupamos los valores consecutivos que parecen pertenecer al
+  # mismo "regimen" (es decir, que no pegan un salto raro entre si)
+  grupo <- rep(NA_integer_, n)
+  g <- 1
+  for (i in 1:n) {
+    if (i == 1) {
+      grupo[i] <- g
+      next
+    }
+    v_prev <- corregido[i - 1]
+    v_curr <- corregido[i]
+    if (is.na(v_prev) || is.na(v_curr) || v_prev <= 0 || v_curr <= 0) {
+      g <- g + 1
+      grupo[i] <- g
+      next
+    }
+    ratio <- max(v_curr, v_prev) / min(v_curr, v_prev)
+    if (ratio <= umbral_mismo_regimen) grupo[i] <- g else { g <- g + 1; grupo[i] <- g }
+  }
+
+  # Para cada grupo, probamos si "recuperar el cero" (multiplicar la parte
+  # entera por 10) lo acerca mas al valor del grupo anterior o siguiente
+  for (g in unique(grupo)) {
+    idx <- which(grupo == g)
+    vals_seg <- corregido[idx]
+    if (any(is.na(vals_seg)) || any(vals_seg >= 10) || any(vals_seg <= 0)) next
+
+    candidatos <- floor(vals_seg) * 10 + (vals_seg - floor(vals_seg))
+
+    ref_antes   <- if (min(idx) > 1) corregido[min(idx) - 1] else NA
+    ref_despues <- if (max(idx) < n) corregido[max(idx) + 1] else NA
+
+    conecta_antes   <- !is.na(ref_antes)   && abs(candidatos[1] - ref_antes) / ref_antes < 0.3
+    conecta_despues <- !is.na(ref_despues) && abs(candidatos[length(candidatos)] - ref_despues) / ref_despues < 0.3
+
+    if (conecta_antes || conecta_despues) corregido[idx] <- candidatos
+  }
+
+  corregido
+}
+```
+
+Aplicamos la funcion pais por pais (para no mezclar datos de un pais con
+los de otro) y llevamos la cuenta de cuantos valores se corrigieron en
+cada columna.
+
+```{r aplicar-cero-perdido}
+cols_cero_perdido <- c("Thinness_ten_nineteen_years", "Thinness_five_nine_years")
+resumen_cero <- data.frame(columna = character(), corregidos = integer())
+
+for (col in cols_cero_perdido) {
+  original_col <- df[[col]]
+  df <- df %>%
+    group_by(Country) %>%
+    group_modify(function(g, key) {
+      g[[col]] <- corregir_cero_perdido(g[[col]])
+      g
+    }) %>%
+    ungroup()
+  n_corregidos <- sum(original_col != df[[col]], na.rm = TRUE)
+  resumen_cero <- rbind(resumen_cero, data.frame(columna = col, corregidos = n_corregidos))
+}
+
+df <- df %>% arrange(Country, Year)  # el group_modify puede desordenar las filas
+
+kable(resumen_cero)
+```
+
+## Correccion puntual: Eritrea 2015
+
+Al revisar la base pais por pais notamos un salto que no tiene explicacion
+logica, en Eritrea, entre 2014 y 2015, el PIB per capita y la poblacion
+cambian de forma abrupta y despues vuelven a un valor cercano al de antes
+en la siguiente medicion. No es un patron que la funcion anterior pueda
+resolver porque es un caso puntual, asi que lo corregimos a mano con el valor real reportado por el
+Banco Mundial para ese año.
+
+```{r correccion-eritrea}
+cat("Antes de la correccion:\n")
+df %>% filter(Country == "Eritrea", Year == 2015) %>% select(GDP_per_capita, Population_mln) %>% print()
+
+df$GDP_per_capita[df$Country == "Eritrea" & df$Year == 2015] <- 901.1
+df$Population_mln[df$Country == "Eritrea" & df$Year == 2015] <- 3.5
+
+cat("\nDespues de la correccion:\n")
+df %>% filter(Country == "Eritrea", Year == 2015) %>% select(GDP_per_capita, Population_mln) %>% print()
+```
+
+## Variables cualitativas nuevas
+
+El proyecto pide trabajar con variables cualitativas, y la base solo trae tres de forma nativa: `Country`, `Region` y el `Status` que armamos antes. Para llegar a las 6 que necesitamos, convertimos tres variables numericas relevantes en categorias. A diferencia de un corte estadistico como los terciles que reparte las observaciones en grupos de igual tamaño pero cuyos limites no significan nada fuera de esta muestra, aqui usamos clasificaciones estandar reconocidas internacionalmente, de modo que cada categoria tenga una interpretacion sustantiva y comparable con otros estudios.
+
+## ¿De donde salen los rangos?
+
+`GDP_per_capita` (clasificacion de ingreso del Banco Mundial): El Banco Mundial agrupa las economias del mundo en cuatro niveles de ingreso (bajo, medio-bajo, medio-alto y alto). Usamos los umbrales del año fiscal 2016, basados en datos de 2014: ingreso bajo hasta 1.045 USD, medio-bajo entre 1.046 y 4.125 USD, medio-alto entre 4.126 y 12.736 USD, y alto por encima de 12.736 USD.
+
+Elegimos deliberadamente los umbrales de FY2016 y no los vigentes hoy, porque el Banco Mundial ajusta estos cortes cada año por inflacion y los de FY2016 caen dentro del periodo que cubre el dataset (2000-2015). Aplicar los umbrales actuales, definidos sobre datos de 2025, a observaciones del año 2000 supondria arrastrar mas de dos decadas de inflacion acumulada.
+
+`Schooling` (niveles educativos segun la ISCED): La Clasificacion Internacional Normalizada de la Educacion agrupa los niveles educativos en tres bloques ampliamente usados en la literatura: nivel bajo (hasta secundaria baja), intermedio (secundaria alta o post-secundaria no terciaria) y alto (educacion terciaria). Trasladados a años promedio de escolaridad, esto corresponde aproximadamente a: Baja (<9 años), Media (9 a 13 años) y Alta (>=13 años).
+
+`BMI` (categorias de la Organizacion Mundial de la Salud): La OMS define cuatro categorias de Indice de Masa Corporal: bajo peso (<18,5), peso normal (18,5 a 25), sobrepeso (25 a 30) y obesidad (>=30). Es la clasificacion mas estandarizada de las tres y no presenta ambiguedad en sus puntos de corte.
+
+## Posibles sesgos de los umbrales
+
+Los umbrales se definen sobre GNI, pero se aplican a GDP. Esta es la limitacion mas relevante de las tres. La clasificacion del Banco Mundial se calcula sobre el GNI per capita (ingreso nacional bruto y el método Atlas), mientras que la variable de nuestro dataset es GDP per capita (producto interno bruto). El GDP mide el ingreso generado dentro de las fronteras del pais, mientras que el GNI incluye ademas el ingreso que sus residentes obtienen en el exterior; el metodo Atlas, por su parte, suaviza las fluctuaciones del tipo de cambio, cosa que nuestra variable no hace. Ambas medidas estan fuertemente correlacionadas y usarlas de forma intercambiable es una aproximacion habitual, pero las categorias resultantes no equivalen a la clasificacion oficial del Banco Mundial: un pais con mucha inversion extranjera o muchas remesas puede caer en una categoria distinta a la que le asignaria el Banco.
+
+Aunque los umbrales de FY2016 caen dentro del periodo analizado, se aplican por igual a los 16 años del dataset. Esto deja un desfase inflacionario residual para los años mas tempranos (un pais en el año 2000 se evalua con umbrales de 2014), de modo que parte de la "mejora" observada entre 2000 y 2015 puede reflejar inflacion acumulada y no solo crecimiento economico real. El sesgo es considerablemente menor que si usaramos los umbrales vigentes, y se opto por un corte fijo para mantener la comparabilidad interna entre años.
+
+Los cortes de escolaridad son una aproximacion. A diferencia del Banco Mundial y la OMS, ISCED clasifica niveles educativos alcanzados, no años promedio de escolaridad, por lo que la equivalencia a 9 y 13 años es una traduccion razonable pero no una definición oficial.
+
+```{r funcion-rangos}
+cualificar_rangos <- function(x, breaks, labels, right = TRUE) {
+  cut(x, breaks = breaks, labels = labels, right = right, include.lowest = TRUE)
+}
+```
+
+```{r aplicar-rangos}
+df <- df %>%
+  mutate(
+    GDP_per_capita_cat = cualificar_rangos(
+      GDP_per_capita,
+      breaks = c(-Inf, 1045, 4125, 12736, Inf),
+      labels = c("Ingreso bajo", "Ingreso medio-bajo",
+                 "Ingreso medio-alto", "Ingreso alto"),
+      right = TRUE
+    ),
+    Schooling_cat = cualificar_rangos(
+      Schooling,
+      breaks = c(-Inf, 9, 13, Inf),
+      labels = c("Baja", "Media", "Alta"),
+      right = FALSE
+    ),
+    BMI_cat = cualificar_rangos(
+      BMI,
+      breaks = c(-Inf, 25, 30, Inf),
+      labels = c("Peso normal", "Sobrepeso", "Obesidad"),
+      right = FALSE
+    )
+  ) %>%
+  relocate(GDP_per_capita_cat, .after = GDP_per_capita) %>%
+  relocate(Schooling_cat, .after = Schooling) %>%
+  relocate(BMI_cat, .after = BMI)
+```
+
+```{r distribucion}
+table(df$GDP_per_capita_cat)
+table(df$Schooling_cat)
+table(df$BMI_cat)
+```
+
+Dejamos registro de los criterios y fuentes usadas para cada corte:
+
+```{r rangos}
+cat("GDP_per_capita_cat -> Banco Mundial, año fiscal 2016 (datos de 2014,\n")
+cat("dentro del periodo del dataset). Nota: umbrales definidos sobre GNI\n")
+cat("per capita (metodo Atlas), aplicados aqui a GDP per capita:\n")
+cat("  Ingreso bajo:       <= 1,045 USD\n")
+cat("  Ingreso medio-bajo:   1,046 - 4,125 USD\n")
+cat("  Ingreso medio-alto:   4,126 - 12,736 USD\n")
+cat("  Ingreso alto:       > 12,736 USD\n\n")
+cat("Schooling_cat -> ISCED / UNESCO:\n")
+cat("  Baja:  < 9 años (no completa secundaria baja)\n")
+cat("  Media: 9 - 13 años (secundaria alta completa)\n")
+cat("  Alta:  >= 13 años (acceso a educacion terciaria)\n\n")
+
+cat("BMI_cat -> Organizacion Mundial de la Salud (OMS):\n")
+cat("  Peso normal:  18.5 - 25\n")
+cat("  Sobrepeso:    25 - 30\n")
+cat("  Obesidad:     >= 30\n")
+```
+
+# Verificacion final
+
+Con esto ya tenemos las 6 variables cualitativas que pide el proyecto
+(`Country`, `Region`, `Status`, `GDP_per_capita_cat`, `Schooling_cat`,
+`BMI_cat`), los errores de captura corregidos, y la base
+ordenada.
+
+```{r verificacion-final}
+cat("Filas:", nrow(df), "\n")
+cat("Columnas:", ncol(df), "\n")
+
+kable(head(df, 5))
+```
+
+# Exportar la base limpia
+
+Guardamos la version limpia en la carpeta `data/` para usarla directamente
+en la siguiente entrega, sin tener que correr toda la limpieza de nuevo.
+
+```{r exportar}
+write_csv(df, "Life-Expectancy-Data-Clean.csv")
+```
